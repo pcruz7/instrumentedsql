@@ -232,7 +232,7 @@ func (c wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx dri
 }
 
 func (c wrappedConn) PrepareContext(ctx context.Context, query string) (stmt driver.Stmt, err error) {
-	parentSpan := c.GetSpan(ctx).NewChild(SQLPrepare)
+	parentSpan := c.GetSpan(ctx).NewChild(query)
 	parentSpan.SetLabel(LabelComponent, "database/sql")
 
 	span := parentSpan.NewChild(SQLPrepare)
@@ -353,7 +353,7 @@ func (c wrappedConn) Query(query string, args []driver.Value) (driver.Rows, erro
 }
 
 func (c wrappedConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (rows driver.Rows, err error) {
-	span := c.GetSpan(ctx).NewChild(SQLConnQuery)
+	span := c.GetSpan(ctx).NewChild(query)
 	span.SetLabel(LabelComponent, "database/sql")
 	span.SetLabel(LabelQuery, query)
 	if !c.OmitArgs {
@@ -362,6 +362,9 @@ func (c wrappedConn) QueryContext(ctx context.Context, query string, args []driv
 	defer func() {
 		span.SetError(err)
 		span.Finish()
+		if err != nil {
+			c.closeSpans()
+		}
 		logQuery(ctx, c.opts, SQLConnQuery, query, err, args)
 	}()
 
