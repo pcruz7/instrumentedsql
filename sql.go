@@ -61,9 +61,9 @@ type wrappedDriver struct {
 
 type wrappedConn struct {
 	opts
-	parent     driver.Conn
-	parentSpan Span
-	txSpan     Span
+	parent    driver.Conn
+	querySpan Span
+	txSpan    Span
 }
 
 func newWrappedConn(opt opts, parent driver.Conn, parentSpan, txSpan Span) wrappedConn {
@@ -71,10 +71,14 @@ func newWrappedConn(opt opts, parent driver.Conn, parentSpan, txSpan Span) wrapp
 }
 
 func (c wrappedConn) closeSpans() {
-	c.parentSpan.Finish()
-	c.parentSpan = nil
+	c.querySpan.Finish()
+	c.querySpan = nilSpan
+}
+
+func (c wrappedConn) closeAllSpans() {
+	c.closeSpans()
 	c.txSpan.Finish()
-	c.txSpan = nil
+	c.txSpan = nilSpan
 }
 
 type wrappedTx struct {
@@ -91,9 +95,9 @@ func newWrappedTx(ctx context.Context, opt opts, parent driver.Tx, parentConn wr
 
 func (t wrappedTx) closeSpans() {
 	t.txSpan.Finish()
-	t.txSpan = nil
-	t.parentConn.txSpan.Finish()
-	t.parentConn.txSpan = nil
+	t.txSpan = nilSpan
+	t.parentConn.txSpan = nilSpan
+	t.parentConn = wrappedConn{}
 }
 
 type wrappedStmt struct {
@@ -110,7 +114,7 @@ func newWrappedStmt(ctx context.Context, opt opts, query string, parent driver.S
 
 func (s wrappedStmt) closeSpans() {
 	s.parentSpan.Finish()
-	s.parentSpan = nil
+	s.parentSpan = nilSpan
 }
 
 type wrappedResult struct {
@@ -171,8 +175,8 @@ func (d wrappedDriver) Open(name string) (driver.Conn, error) {
 }
 
 func (c wrappedConn) Prepare(query string) (driver.Stmt, error) {
-	span := c.parentSpan
-	c.parentSpan = nil
+	span := c.querySpan
+	c.querySpan = nilSpan
 
 	parent, err := c.parent.Prepare(query)
 	if err != nil {
@@ -184,7 +188,7 @@ func (c wrappedConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (c wrappedConn) Close() error {
-	c.closeSpans()
+	c.closeAllSpans()
 	return c.parent.Close()
 }
 
@@ -200,6 +204,7 @@ func (c wrappedConn) Begin() (driver.Tx, error) {
 func (c wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx driver.Tx, err error) {
 	parentSpan := c.GetSpan(ctx).NewChild(SQLTxBegin)
 	parentSpan.SetLabel(LabelComponent, "database/sql")
+	c.txSpan = parentSpan
 
 	span := parentSpan.NewChild(SQLTxBegin)
 	span.SetLabel(LabelComponent, "database/sql")
@@ -208,7 +213,7 @@ func (c wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx dri
 		span.Finish()
 
 		if err != nil {
-			c.closeSpans()
+			c.closeAllSpans()
 		}
 
 		c.Log(ctx, SQLTxBegin, "err", err)
@@ -232,8 +237,7 @@ func (c wrappedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (tx dri
 }
 
 func (c wrappedConn) PrepareContext(ctx context.Context, query string) (stmt driver.Stmt, err error) {
-	parentSpan := c.GetSpan(ctx).NewChild(query)
-	parentSpan.SetLabel(LabelComponent, "database/sql")
+	parentSpan := c.querySpan
 
 	span := parentSpan.NewChild(SQLPrepare)
 	span.SetLabel(LabelComponent, "database/sql")
@@ -253,6 +257,7 @@ func (c wrappedConn) PrepareContext(ctx context.Context, query string) (stmt dri
 			return nil, err
 		}
 
+		c.querySpan = nilSpan
 		return newWrappedStmt(ctx, c.opts, query, stmt, parentSpan), nil
 	}
 
@@ -279,14 +284,10 @@ func (c wrappedConn) ExecContext(ctx context.Context, query string, args []drive
 	if !c.OmitArgs {
 		parentSpan.SetLabel(LabelArgs, pretty.Sprint(args))
 	}
-	c.parentSpan = parentSpan
+	c.querySpan = parentSpan
 
 	span := parentSpan.NewChild(SQLConnExec)
 	span.SetLabel(LabelComponent, "database/sql")
-	span.SetLabel(LabelQuery, query)
-	if !c.OmitArgs {
-		span.SetLabel(LabelArgs, pretty.Sprint(args))
-	}
 	defer func() {
 		span.SetError(err)
 		span.Finish()
@@ -353,12 +354,16 @@ func (c wrappedConn) Query(query string, args []driver.Value) (driver.Rows, erro
 }
 
 func (c wrappedConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (rows driver.Rows, err error) {
-	span := c.GetSpan(ctx).NewChild(query)
-	span.SetLabel(LabelComponent, "database/sql")
-	span.SetLabel(LabelQuery, query)
+	parentSpan := c.GetSpan(ctx).NewChild(query)
+	parentSpan.SetLabel(LabelComponent, "database/sql")
+	parentSpan.SetLabel(LabelQuery, query)
 	if !c.OmitArgs {
-		span.SetLabel(LabelArgs, pretty.Sprint(args))
+		parentSpan.SetLabel(LabelArgs, pretty.Sprint(args))
 	}
+	c.querySpan = parentSpan
+
+	span := parentSpan.NewChild(SQLConnExec)
+	span.SetLabel(LabelComponent, "database/sql")
 	defer func() {
 		span.SetError(err)
 		span.Finish()
@@ -450,18 +455,21 @@ func (s wrappedStmt) NumInput() int {
 }
 
 func (s wrappedStmt) Exec(args []driver.Value) (res driver.Result, err error) {
-	span := s.GetSpan(s.ctx).NewChild(SQLStmtExec)
+	span := s.GetSpan(s.ctx)
+	if s.parentSpan != nilSpan {
+		span = s.parentSpan
+	}
+	span = span.NewChild(SQLStmtExec)
 	span.SetLabel(LabelComponent, "database/sql")
 	span.SetLabel(LabelQuery, s.query)
-	span.SetLabel(LabelArgs, pretty.Sprint(args))
+	if !s.OmitArgs {
+		span.SetLabel(LabelArgs, pretty.Sprint(args))
+	}
+
 	defer func() {
 		span.SetError(err)
 		span.Finish()
-
-		if err != nil {
-			s.closeSpans()
-		}
-
+		s.closeSpans()
 		logQuery(s.ctx, s.opts, SQLStmtExec, s.query, err, args)
 	}()
 
@@ -474,17 +482,21 @@ func (s wrappedStmt) Exec(args []driver.Value) (res driver.Result, err error) {
 }
 
 func (s wrappedStmt) Query(args []driver.Value) (rows driver.Rows, err error) {
-	span := s.GetSpan(s.ctx).NewChild(SQLStmtQuery)
+	span := s.GetSpan(s.ctx)
+	if s.parentSpan != nilSpan {
+		span = s.parentSpan
+	}
+	span = span.NewChild(SQLStmtQuery)
 	span.SetLabel(LabelComponent, "database/sql")
 	span.SetLabel(LabelQuery, s.query)
-	span.SetLabel(LabelArgs, pretty.Sprint(args))
+	if !s.OmitArgs {
+		span.SetLabel(LabelArgs, pretty.Sprint(args))
+	}
+
 	defer func() {
 		span.SetError(err)
 		span.Finish()
-
-		if err != nil {
-			s.closeSpans()
-		}
+		s.closeSpans()
 		logQuery(s.ctx, s.opts, SQLStmtQuery, s.query, err, args)
 	}()
 
@@ -497,18 +509,21 @@ func (s wrappedStmt) Query(args []driver.Value) (rows driver.Rows, err error) {
 }
 
 func (s wrappedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (res driver.Result, err error) {
-	span := s.GetSpan(ctx).NewChild(SQLStmtExec)
+	span := s.GetSpan(ctx)
+	if s.parentSpan != nilSpan {
+		span = s.parentSpan
+	}
+	span = span.NewChild(SQLStmtExec)
 	span.SetLabel(LabelComponent, "database/sql")
 	span.SetLabel(LabelQuery, s.query)
-	span.SetLabel(LabelArgs, pretty.Sprint(args))
+	if !s.OmitArgs {
+		span.SetLabel(LabelArgs, pretty.Sprint(args))
+	}
+
 	defer func() {
 		span.SetError(err)
 		span.Finish()
-
-		if err != nil {
-			s.closeSpans()
-		}
-
+		s.closeSpans()
 		logQuery(ctx, s.opts, SQLStmtExec, s.query, err, args)
 	}()
 
@@ -537,18 +552,21 @@ func (s wrappedStmt) ExecContext(ctx context.Context, args []driver.NamedValue) 
 }
 
 func (s wrappedStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (rows driver.Rows, err error) {
-	span := s.GetSpan(ctx).NewChild(SQLStmtQuery)
+	span := s.GetSpan(ctx)
+	if s.parentSpan != nilSpan {
+		span = s.parentSpan
+	}
+	span = span.NewChild(SQLStmtQuery)
 	span.SetLabel(LabelComponent, "database/sql")
 	span.SetLabel(LabelQuery, s.query)
-	span.SetLabel(LabelArgs, pretty.Sprint(args))
+	if !s.OmitArgs {
+		span.SetLabel(LabelArgs, pretty.Sprint(args))
+	}
+
 	defer func() {
 		span.SetError(err)
 		span.Finish()
-
-		if err != nil {
-			s.closeSpans()
-		}
-
+		s.closeSpans()
 		logQuery(ctx, s.opts, SQLStmtQuery, s.query, err, args)
 	}()
 
